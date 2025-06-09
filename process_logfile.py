@@ -5,16 +5,13 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 import logging
+from config import DB_FILE, LOGFILE, SCHEMA  # Import from config
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-DB_FILE = "business_tracking.db"  # More descriptive name
-LOGFILE = "logfile.txt"
-SCHEMA = "schema.sql"
 
 
 def init_db():
@@ -244,36 +241,6 @@ def get_hours_data(date=None, days=7):
         return results
 
 
-def get_weekly_hours_summary():
-    """Get weekly hours summary with totals and averages"""
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-
-        # Get the most recent week's data
-        cursor.execute(
-            """
-            SELECT 
-                MAX(date) as week_ending,
-                MAX(hours_week) as total_hours,
-                COUNT(*) as days_logged,
-                AVG(hours_today) as avg_daily_hours
-            FROM hours
-            WHERE date >= date('now', '-7 days')
-        """
-        )
-
-        row = cursor.fetchone()
-        if row and row[1]:  # Check if we have data
-            return {
-                "week_ending": row[0],
-                "total_hours": row[1],
-                "days_logged": row[2],
-                "avg_daily_hours": row[3],
-                "overtime": max(0, row[1] - 40),  # Assuming 40 hour work week
-            }
-        return None
-
-
 def get_pay_period_dates(date=None, pay_period_start_date="2025-05-19"):
     """
     Calculate pay period start and end dates for a given date.
@@ -284,8 +251,6 @@ def get_pay_period_dates(date=None, pay_period_start_date="2025-05-19"):
         date: The date to check (YYYY-MM-DD format), defaults to today
         pay_period_start_date: A known pay period start date (Monday)
     """
-    from datetime import datetime, timedelta
-
     if date:
         check_date = datetime.strptime(date, "%Y-%m-%d")
     else:
@@ -320,19 +285,39 @@ def get_pay_period_dates(date=None, pay_period_start_date="2025-05-19"):
 
 
 def get_pay_period_hours(date=None):
-    """Get total hours for the current or specified pay period"""
+    """
+    Get total hours for the current or specified pay period.
+    Uses the latest hours_week value as authoritative source.
+    """
     period = get_pay_period_dates(date)
 
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
 
-        # Get all hours entries in this pay period
+        # Get the latest hours_week entry in this pay period
         cursor.execute(
             """
-            SELECT 
-                date,
-                hours_today,
-                hours_week
+            SELECT date, hours_week, hours_today
+            FROM hours 
+            WHERE date >= ? AND date <= ?
+            ORDER BY date DESC
+            LIMIT 1
+        """,
+            (period["start"], period["end"]),
+        )
+
+        latest_entry = cursor.fetchone()
+        if latest_entry:
+            total_hours = latest_entry[1]  # Use hours_week as authoritative
+            latest_date = latest_entry[0]
+        else:
+            total_hours = 0
+            latest_date = None
+
+        # Get all daily entries for crosscheck
+        cursor.execute(
+            """
+            SELECT date, hours_today
             FROM hours
             WHERE date >= ? AND date <= ?
             ORDER BY date
@@ -341,11 +326,31 @@ def get_pay_period_hours(date=None):
         )
 
         daily_hours = []
-        total_hours = 0
+        daily_sum = 0
+        dates_logged = set()
 
         for row in cursor.fetchall():
             daily_hours.append({"date": row[0], "hours": row[1]})
-            total_hours += row[1]
+            daily_sum += row[1]
+            dates_logged.add(row[0])
+
+        # Check for discrepancies
+        discrepancy = total_hours - daily_sum
+
+        # Identify potentially missing days
+        missing_days = []
+        if abs(discrepancy) > 0.1:  # Allow small rounding differences
+            # Calculate expected work days in period up to latest entry
+            if latest_date:
+                current_date = datetime.strptime(period["start"], "%Y-%m-%d")
+                end_check_date = datetime.strptime(latest_date, "%Y-%m-%d")
+
+                while current_date <= end_check_date:
+                    date_str = current_date.strftime("%Y-%m-%d")
+                    # Skip Mondays (restaurant closed) and logged days
+                    if current_date.weekday() != 0 and date_str not in dates_logged:
+                        missing_days.append(date_str)
+                    current_date += timedelta(days=1)
 
         # Calculate regular vs overtime (over 80 hours per pay period)
         regular_hours = min(total_hours, 80)
@@ -355,11 +360,15 @@ def get_pay_period_hours(date=None):
             "period_start": period["start"],
             "period_end": period["end"],
             "days_remaining": period["days_remaining"],
-            "total_hours": total_hours,
+            "total_hours": total_hours,  # Authoritative from hours_week
+            "daily_sum": daily_sum,  # Sum of daily entries
+            "discrepancy": discrepancy,  # Difference for validation
+            "missing_days": missing_days,  # Days that might be missing
             "regular_hours": regular_hours,
             "overtime_hours": overtime_hours,
             "daily_breakdown": daily_hours,
             "days_worked": len(daily_hours),
+            "latest_entry_date": latest_date,
         }
 
 
@@ -390,7 +399,7 @@ def get_pay_period_comparison(num_periods=3):
 
 
 def get_current_pay_period_info():
-    """Get detailed info about the current pay period"""
+    """Get detailed info about the current pay period with validation"""
     period = get_pay_period_dates()
     period_hours = get_pay_period_hours()
 
@@ -405,12 +414,16 @@ def get_current_pay_period_info():
             remaining_days.append(current_date.strftime("%Y-%m-%d"))
         current_date += timedelta(days=1)
 
-    return {
+    # Build info dictionary
+    info = {
         "period_start": period["start"],
         "period_end": period["end"],
         "current_day": period["current_day"],
         "total_days": 14,
         "hours_logged": period_hours["total_hours"],
+        "daily_sum": period_hours["daily_sum"],
+        "discrepancy": period_hours["discrepancy"],
+        "missing_days": period_hours["missing_days"],
         "days_worked": period_hours["days_worked"],
         "remaining_work_days": len(remaining_days),
         "avg_hours_needed": (
@@ -419,6 +432,8 @@ def get_current_pay_period_info():
             else 0
         ),
     }
+
+    return info
 
 
 def process_all():
