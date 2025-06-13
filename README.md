@@ -4,11 +4,20 @@ Backend service for processing and storing SMS-based logging data for mileage an
 
 ## Overview
 
-This service receives parsed SMS data from the [sms-logger](https://github.com/kevinkeithley/sms-logger) ingester via Tailscale and:
+This service receives parsed SMS data from the [sms-logger](https://github.com/kevinkeithley/sms-logger) ingester via WireGuard VPN and:
 - Stores raw mileage entries (start/mid/end odometer readings)
 - Calculates daily mileage totals
-- Tracks hours worked with weekly totals
+- Tracks hours worked with bi-weekly pay period support
 - Maintains all data in a local SQLite database
+
+## Features
+
+- **Flask API** for receiving log entries
+- **SQLite database** for local storage
+- **Automatic mileage calculation** from odometer readings
+- **Bi-weekly pay period tracking** with week-by-week breakdown
+- **Eastern timezone** awareness for all timestamps
+- **Hours validation** against employer's weekly totals
 
 ## Features
 
