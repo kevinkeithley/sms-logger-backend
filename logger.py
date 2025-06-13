@@ -9,7 +9,7 @@ from process_logfile import (
     get_hours_data,
     get_pay_period_hours,
     get_current_pay_period_info,
-    get_pay_period_comparison,
+    get_pay_period_detail,  # Add this import
     process_all,
 )
 
@@ -45,62 +45,40 @@ def query_data():
             info = get_current_pay_period_info()
             response = (
                 f"Pay Period: {info['period_start']} - {info['period_end']}\n"
-                f"Day {info['current_day']} of 14\n"
-                f"Hours: {info['hours_logged']:.1f} ({info['days_worked']} days)\n"
+                f"Day {info['current_day']} of 14 (Week {info['current_week']})\n"
+                f"Hours: {info['hours_logged']:.1f} (W1: {info['week1_hours']:.1f}, W2: {info['week2_hours']:.1f})\n"
             )
-
-            # Add discrepancy warning if needed
-            if abs(info["discrepancy"]) > 0.1:
-                response += f"⚠️ Check: Daily sum is {info['daily_sum']:.1f}\n"
-                if info["missing_days"]:
-                    response += f"Missing: {len(info['missing_days'])} day(s)\n"
-
+            
             response += f"Work days left: {info['remaining_work_days']}\n"
 
             if info["avg_hours_needed"] > 0:
                 response += f"Need {info['avg_hours_needed']:.1f} hrs/day for 80 total"
 
-        elif query_type == "pay_period":
-            # Current pay period summary
-            result = get_pay_period_hours()
-            response = (
-                f"Period: {result['period_start']} - {result['period_end']}\n"
-                f"Total: {result['total_hours']:.1f}hrs "
-                f"(Reg: {result['regular_hours']:.1f}, OT: {result['overtime_hours']:.1f})\n"
-            )
-
-            # Show validation info
-            if abs(result["discrepancy"]) > 0.1:
-                response += f"Daily sum: {result['daily_sum']:.1f} "
-                response += f"(diff: {result['discrepancy']:+.1f})\n"
-                if result["missing_days"]:
-                    response += f"Check days: {', '.join(result['missing_days'][:2])}\n"
-
-            response += f"Days left: {result['days_remaining']}"
-
-        elif query_type == "pay_history":
-            # Compare last 3 pay periods
-            periods = get_pay_period_comparison(3)
-            response = "Recent Pay Periods:\n"
-            for p in periods[:3]:  # Limit for SMS length
-                response += f"{p['period'].split(' to ')[0]}: {p['total_hours']:.1f}hrs"
-                if p["overtime_hours"] > 0:
-                    response += f" (OT: {p['overtime_hours']:.1f})"
-                response += "\n"
+        elif query_type == "pay_detail":
+            # New PAYDETAIL function - replaces pay_period
+            result = get_pay_period_detail()
+            response = f"Pay Period: {result['period_start']} - {result['period_end']}\n"
+            
+            if result['daily_hours']:
+                for entry in result['daily_hours']:
+                    response += f"{entry['date']}: {entry['hours']:.1f} hrs\n"
+                response += f"Total: {result['total_hours']:.1f} hrs ({result['days_worked']} days)"
+            else:
+                response = "No hours logged this pay period"
 
         elif query_type == "hours_check":
-            # New command to validate hours
+            # Validate hours with bi-weekly handling
             result = get_pay_period_hours()
             if abs(result["discrepancy"]) < 0.1:
                 response = "✅ Hours match! No discrepancies found."
             else:
                 response = (
-                    f"Weekly total: {result['total_hours']:.1f}hrs\n"
+                    f"Pay period total: {result['total_hours']:.1f}hrs\n"
+                    f"Week 1: {result['week1_hours']:.1f}hrs\n"
+                    f"Week 2: {result['week2_hours']:.1f}hrs\n"
                     f"Daily sum: {result['daily_sum']:.1f}hrs\n"
-                    f"Difference: {result['discrepancy']:+.1f}hrs\n"
+                    f"Difference: {result['discrepancy']:+.1f}hrs"
                 )
-                if result["missing_days"]:
-                    response += f"Missing days: {', '.join(result['missing_days'])}"
 
         elif query_type == "mileage_summary":
             # Get recent mileage
@@ -146,7 +124,7 @@ def query_data():
                 response = "No hours data found"
 
         else:
-            response = "Unknown query type. Try: pay_status, pay_period, mileage_today, hours_week"
+            response = "Unknown query type. Try: PAYSTATUS, PAYDETAIL, HOURSCHECK, MILES"
 
         return jsonify({"status": "success", "message": response}), 200
 

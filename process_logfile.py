@@ -213,7 +213,7 @@ def get_summary_data(name=None, date=None, days=7):
         return results
 
 
-def get_hours_data(date=None, days=7):
+def get_hours_data(date=None, days=7, date_start=None, date_end=None):
     """Get hours data for API responses"""
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
@@ -221,7 +221,10 @@ def get_hours_data(date=None, days=7):
         query = "SELECT date, hours_today, hours_week FROM hours WHERE 1=1"
         params = []
 
-        if date:
+        if date_start and date_end:
+            query += " AND date >= ? AND date <= ?"
+            params.extend([date_start, date_end])
+        elif date:
             query += " AND date = ?"
             params.append(date)
         else:
@@ -285,90 +288,155 @@ def get_pay_period_dates(date=None, pay_period_start_date="2025-05-19"):
 
 
 def get_pay_period_hours(date=None):
-    """
-    Get total hours for the current or specified pay period.
-    Uses the latest hours_week value as authoritative source.
-    """
+    """Get hours using the latest hours_week value per week in the pay period"""
     period = get_pay_period_dates(date)
-
+    
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-
-        # Get the latest hours_week entry in this pay period
-        cursor.execute(
-            """
+        
+        # Determine the middle of the pay period (start of week 2)
+        period_start = datetime.strptime(period["start"], "%Y-%m-%d")
+        week2_start = period_start + timedelta(days=7)
+        week2_start_str = week2_start.strftime("%Y-%m-%d")
+        
+        # Get the latest hours_week entry from each week
+        # Week 1
+        cursor.execute("""
             SELECT date, hours_week, hours_today
-            FROM hours 
+            FROM hours
+            WHERE date >= ? AND date < ?
+            ORDER BY date DESC
+            LIMIT 1
+        """, (period["start"], week2_start_str))
+        
+        week1_data = cursor.fetchone()
+        week1_total = week1_data[1] if week1_data else 0
+        
+        # Week 2
+        cursor.execute("""
+            SELECT date, hours_week, hours_today
+            FROM hours
             WHERE date >= ? AND date <= ?
             ORDER BY date DESC
             LIMIT 1
-        """,
-            (period["start"], period["end"]),
-        )
-
-        latest_entry = cursor.fetchone()
-        if latest_entry:
-            total_hours = latest_entry[1]  # Use hours_week as authoritative
-            latest_date = latest_entry[0]
-        else:
-            total_hours = 0
-            latest_date = None
-
-        # Get all daily entries for crosscheck
-        cursor.execute(
-            """
+        """, (week2_start_str, period["end"]))
+        
+        week2_data = cursor.fetchone()
+        week2_total = week2_data[1] if week2_data else 0
+        
+        # Total for pay period is sum of both weeks
+        total_hours = week1_total + week2_total
+        
+        # Get daily breakdown for validation
+        cursor.execute("""
             SELECT date, hours_today
             FROM hours
             WHERE date >= ? AND date <= ?
             ORDER BY date
-        """,
-            (period["start"], period["end"]),
-        )
-
+        """, (period["start"], period["end"]))
+        
         daily_hours = []
         daily_sum = 0
-        dates_logged = set()
-
         for row in cursor.fetchall():
             daily_hours.append({"date": row[0], "hours": row[1]})
             daily_sum += row[1]
-            dates_logged.add(row[0])
-
-        # Check for discrepancies
-        discrepancy = total_hours - daily_sum
-
-        # Identify potentially missing days
-        missing_days = []
-        if abs(discrepancy) > 0.1:  # Allow small rounding differences
-            # Calculate expected work days in period up to latest entry
-            if latest_date:
-                current_date = datetime.strptime(period["start"], "%Y-%m-%d")
-                end_check_date = datetime.strptime(latest_date, "%Y-%m-%d")
-
-                while current_date <= end_check_date:
-                    date_str = current_date.strftime("%Y-%m-%d")
-                    # Skip Mondays (restaurant closed) and logged days
-                    if current_date.weekday() != 0 and date_str not in dates_logged:
-                        missing_days.append(date_str)
-                    current_date += timedelta(days=1)
-
-        # Calculate regular vs overtime (over 80 hours per pay period)
+        
+        # Calculate regular vs overtime
         regular_hours = min(total_hours, 80)
         overtime_hours = max(0, total_hours - 80)
-
+        
         return {
             "period_start": period["start"],
             "period_end": period["end"],
             "days_remaining": period["days_remaining"],
-            "total_hours": total_hours,  # Authoritative from hours_week
-            "daily_sum": daily_sum,  # Sum of daily entries
-            "discrepancy": discrepancy,  # Difference for validation
-            "missing_days": missing_days,  # Days that might be missing
+            "total_hours": total_hours,
+            "week1_hours": week1_total,
+            "week2_hours": week2_total,
+            "daily_sum": daily_sum,
+            "discrepancy": total_hours - daily_sum,
             "regular_hours": regular_hours,
             "overtime_hours": overtime_hours,
             "daily_breakdown": daily_hours,
-            "days_worked": len(daily_hours),
-            "latest_entry_date": latest_date,
+            "days_worked": len(daily_hours)
+        }
+
+
+def get_current_pay_period_info(date=None):
+    """Get current pay period status with weekly totals properly handled"""
+    period = get_pay_period_dates(date)
+    hours_data = get_pay_period_hours(date)
+    
+    # Determine which week we're in
+    current_date = datetime.strptime(date or datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")
+    period_start = datetime.strptime(period["start"], "%Y-%m-%d")
+    days_into_period = (current_date - period_start).days + 1
+    current_week = 1 if days_into_period <= 7 else 2
+    
+    info = {
+        "period_start": period["start"],
+        "period_end": period["end"],
+        "current_day": days_into_period,
+        "current_week": current_week,
+        "hours_logged": hours_data["total_hours"],
+        "week1_hours": hours_data["week1_hours"],
+        "week2_hours": hours_data["week2_hours"],
+        "days_worked": hours_data["days_worked"],
+        "remaining_work_days": 0,
+        "avg_hours_needed": 0
+    }
+    
+    # Calculate remaining work days (exclude Mondays)
+    remaining_days = []
+    current = current_date + timedelta(days=1)
+    end = datetime.strptime(period["end"], "%Y-%m-%d")
+    
+    while current <= end:
+        if current.weekday() != 0:  # Not Monday
+            remaining_days.append(current)
+        current += timedelta(days=1)
+    
+    info["remaining_work_days"] = len(remaining_days)
+    
+    # Calculate hours needed per day
+    if info["remaining_work_days"] > 0:
+        hours_still_needed = max(0, 80 - info["hours_logged"])
+        info["avg_hours_needed"] = round(hours_still_needed / info["remaining_work_days"], 1)
+    
+    return info
+
+
+def get_pay_period_detail(date=None):
+    """Get detailed daily hours for the pay period"""
+    period = get_pay_period_dates(date)
+    
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        
+        # Get all daily entries in this pay period
+        cursor.execute("""
+            SELECT date, hours_today
+            FROM hours
+            WHERE date >= ? AND date <= ?
+            ORDER BY date
+        """, (period["start"], period["end"]))
+        
+        daily_hours = []
+        total_hours = 0
+        
+        for row in cursor.fetchall():
+            date, hours = row
+            daily_hours.append({
+                "date": date,
+                "hours": hours
+            })
+            total_hours += hours
+        
+        return {
+            "period_start": period["start"],
+            "period_end": period["end"],
+            "daily_hours": daily_hours,
+            "total_hours": total_hours,
+            "days_worked": len(daily_hours)
         }
 
 
@@ -396,44 +464,6 @@ def get_pay_period_comparison(num_periods=3):
         )
 
     return results
-
-
-def get_current_pay_period_info():
-    """Get detailed info about the current pay period with validation"""
-    period = get_pay_period_dates()
-    period_hours = get_pay_period_hours()
-
-    # Calculate expected remaining work days (excluding Mondays)
-    remaining_days = []
-    current_date = datetime.now()
-    end_date = datetime.strptime(period["end"], "%Y-%m-%d")
-
-    while current_date.date() <= end_date.date():
-        # Skip Mondays (restaurant closed)
-        if current_date.weekday() != 0:  # 0 = Monday
-            remaining_days.append(current_date.strftime("%Y-%m-%d"))
-        current_date += timedelta(days=1)
-
-    # Build info dictionary
-    info = {
-        "period_start": period["start"],
-        "period_end": period["end"],
-        "current_day": period["current_day"],
-        "total_days": 14,
-        "hours_logged": period_hours["total_hours"],
-        "daily_sum": period_hours["daily_sum"],
-        "discrepancy": period_hours["discrepancy"],
-        "missing_days": period_hours["missing_days"],
-        "days_worked": period_hours["days_worked"],
-        "remaining_work_days": len(remaining_days),
-        "avg_hours_needed": (
-            (80 - period_hours["total_hours"]) / max(1, len(remaining_days))
-            if len(remaining_days) > 0
-            else 0
-        ),
-    }
-
-    return info
 
 
 def process_all():
