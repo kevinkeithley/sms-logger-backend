@@ -9,7 +9,8 @@ from process_logfile import (
     get_hours_data,
     get_pay_period_hours,
     get_current_pay_period_info,
-    get_pay_period_detail,  # Add this import
+    get_pay_period_detail,
+    get_pay_history,  # Add this import
     process_all,
 )
 
@@ -55,7 +56,7 @@ def query_data():
                 response += f"Need {info['avg_hours_needed']:.1f} hrs/day for 80 total"
 
         elif query_type == "pay_detail":
-            # New PAYDETAIL function - replaces pay_period
+            # PAYDETAIL function
             result = get_pay_period_detail()
             response = f"Pay Period: {result['period_start']} - {result['period_end']}\n"
             
@@ -65,6 +66,25 @@ def query_data():
                 response += f"Total: {result['total_hours']:.1f} hrs ({result['days_worked']} days)"
             else:
                 response = "No hours logged this pay period"
+
+        elif query_type == "pay_history":
+            # PAYHISTORY - Show last 3 pay periods with weekly breakdown
+            history = get_pay_history(3)
+            response = "Pay Period History:\n"
+            
+            for i, period in enumerate(history):
+                if i == 0:
+                    response += "Current: "
+                else:
+                    response += f"Period -{i}: "
+                
+                response += f"{period['total_hours']:.1f}hrs "
+                response += f"(W1: {period['week1_hours']:.1f}, W2: {period['week2_hours']:.1f})"
+                
+                if period['overtime_hours'] > 0:
+                    response += f" OT: {period['overtime_hours']:.1f}"
+                
+                response += "\n"
 
         elif query_type == "hours_check":
             # Validate hours with bi-weekly handling
@@ -124,7 +144,7 @@ def query_data():
                 response = "No hours data found"
 
         else:
-            response = "Unknown query type. Try: PAYSTATUS, PAYDETAIL, HOURSCHECK, MILES"
+            response = "Unknown query type. Try: PAYSTATUS, PAYDETAIL, PAYHISTORY, HOURSCHECK, MILES"
 
         return jsonify({"status": "success", "message": response}), 200
 

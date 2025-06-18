@@ -5,7 +5,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 import logging
-from config import DB_FILE, LOGFILE, SCHEMA  # Import from config
+from config import DB_FILE, LOGFILE, SCHEMA, PAY_PERIOD_START  # Import from config
 
 # Configure logging
 logging.basicConfig(
@@ -244,7 +244,7 @@ def get_hours_data(date=None, days=7, date_start=None, date_end=None):
         return results
 
 
-def get_pay_period_dates(date=None, pay_period_start_date="2025-05-19"):
+def get_pay_period_dates(date=None, pay_period_start_date=None):
     """
     Calculate pay period start and end dates for a given date.
     Pay periods start on Mondays, bi-weekly (14 days).
@@ -254,12 +254,15 @@ def get_pay_period_dates(date=None, pay_period_start_date="2025-05-19"):
         date: The date to check (YYYY-MM-DD format), defaults to today
         pay_period_start_date: A known pay period start date (Monday)
     """
+    if not pay_period_start_date:
+        pay_period_start_date = PAY_PERIOD_START
+        
     if date:
         check_date = datetime.strptime(date, "%Y-%m-%d")
     else:
         check_date = datetime.now()
 
-    # Known pay period start (Monday May 19, 2025)
+    # Known pay period start (Monday)
     known_start = datetime.strptime(pay_period_start_date, "%Y-%m-%d")
 
     # Verify it's a Monday (0 = Monday in Python)
@@ -288,58 +291,60 @@ def get_pay_period_dates(date=None, pay_period_start_date="2025-05-19"):
 
 
 def get_pay_period_hours(date=None):
-    """Get hours using the latest hours_week value per week in the pay period"""
+    """Get hours for a pay period with proper weekly breakdown"""
     period = get_pay_period_dates(date)
     
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         
-        # Determine the middle of the pay period (start of week 2)
+        # Get the Sunday of week 1 (last day of week 1)
         period_start = datetime.strptime(period["start"], "%Y-%m-%d")
-        week2_start = period_start + timedelta(days=7)
-        week2_start_str = week2_start.strftime("%Y-%m-%d")
+        week1_end = period_start + timedelta(days=6)  # Monday + 6 = Sunday
+        week1_end_str = week1_end.strftime("%Y-%m-%d")
         
-        # Get the latest hours_week entry from each week
-        # Week 1
+        # Get ALL entries for the pay period
         cursor.execute("""
-            SELECT date, hours_week, hours_today
-            FROM hours
-            WHERE date >= ? AND date < ?
-            ORDER BY date DESC
-            LIMIT 1
-        """, (period["start"], week2_start_str))
-        
-        week1_data = cursor.fetchone()
-        week1_total = week1_data[1] if week1_data else 0
-        
-        # Week 2
-        cursor.execute("""
-            SELECT date, hours_week, hours_today
-            FROM hours
-            WHERE date >= ? AND date <= ?
-            ORDER BY date DESC
-            LIMIT 1
-        """, (week2_start_str, period["end"]))
-        
-        week2_data = cursor.fetchone()
-        week2_total = week2_data[1] if week2_data else 0
-        
-        # Total for pay period is sum of both weeks
-        total_hours = week1_total + week2_total
-        
-        # Get daily breakdown for validation
-        cursor.execute("""
-            SELECT date, hours_today
+            SELECT date, hours_today, hours_week
             FROM hours
             WHERE date >= ? AND date <= ?
             ORDER BY date
         """, (period["start"], period["end"]))
         
-        daily_hours = []
+        all_entries = cursor.fetchall()
+        
+        # Process entries to get weekly totals
+        week1_hours = 0
+        week2_hours = 0
         daily_sum = 0
-        for row in cursor.fetchall():
-            daily_hours.append({"date": row[0], "hours": row[1]})
-            daily_sum += row[1]
+        daily_breakdown = []
+        
+        # Track the last hours_week value for each week
+        last_week1_entry = None
+        last_week2_entry = None
+        
+        for date_str, hours_today, hours_week in all_entries:
+            daily_breakdown.append({"date": date_str, "hours": hours_today})
+            daily_sum += hours_today
+            
+            # Determine which week this entry belongs to
+            entry_date = datetime.strptime(date_str, "%Y-%m-%d")
+            
+            if entry_date <= week1_end:
+                # Week 1 entry
+                last_week1_entry = (date_str, hours_week)
+            else:
+                # Week 2 entry
+                last_week2_entry = (date_str, hours_week)
+        
+        # Use the last hours_week value from each week
+        if last_week1_entry:
+            week1_hours = last_week1_entry[1]
+            
+        if last_week2_entry:
+            week2_hours = last_week2_entry[1]
+        
+        # Total for pay period
+        total_hours = week1_hours + week2_hours
         
         # Calculate regular vs overtime
         regular_hours = min(total_hours, 80)
@@ -350,14 +355,14 @@ def get_pay_period_hours(date=None):
             "period_end": period["end"],
             "days_remaining": period["days_remaining"],
             "total_hours": total_hours,
-            "week1_hours": week1_total,
-            "week2_hours": week2_total,
+            "week1_hours": week1_hours,
+            "week2_hours": week2_hours,
             "daily_sum": daily_sum,
             "discrepancy": total_hours - daily_sum,
             "regular_hours": regular_hours,
             "overtime_hours": overtime_hours,
-            "daily_breakdown": daily_hours,
-            "days_worked": len(daily_hours)
+            "daily_breakdown": daily_breakdown,
+            "days_worked": len(daily_breakdown)
         }
 
 
@@ -440,29 +445,34 @@ def get_pay_period_detail(date=None):
         }
 
 
-def get_pay_period_comparison(num_periods=3):
-    """Compare hours across multiple pay periods"""
+def get_pay_history(num_periods=3):
+    """Get pay period history with weekly breakdown"""
     results = []
-
-    # Get current pay period
+    
+    # Start from current period and work backwards
     current_period = get_pay_period_dates()
     check_date = datetime.strptime(current_period["start"], "%Y-%m-%d")
-
+    
     for i in range(num_periods):
-        # Go back i pay periods
+        # Calculate the date for this historical period
         period_date = (check_date - timedelta(days=14 * i)).strftime("%Y-%m-%d")
+        
+        # Get the data for this pay period
         period_data = get_pay_period_hours(period_date)
-
-        results.append(
-            {
-                "period": f"{period_data['period_start']} to {period_data['period_end']}",
-                "total_hours": period_data["total_hours"],
-                "regular_hours": period_data["regular_hours"],
-                "overtime_hours": period_data["overtime_hours"],
-                "days_worked": period_data["days_worked"],
-            }
-        )
-
+        period_info = get_pay_period_dates(period_date)
+        
+        # Add to results
+        results.append({
+            "period_start": period_info["start"],
+            "period_end": period_info["end"],
+            "total_hours": period_data["total_hours"],
+            "week1_hours": period_data["week1_hours"],
+            "week2_hours": period_data["week2_hours"],
+            "regular_hours": period_data["regular_hours"],
+            "overtime_hours": period_data["overtime_hours"],
+            "days_worked": period_data["days_worked"]
+        })
+    
     return results
 
 
